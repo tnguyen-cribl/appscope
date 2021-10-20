@@ -4760,6 +4760,10 @@ scopeLog(cfg_log_level_t level, const char *format, ...)
     char scope_log_var_buf[LOG_BUF_SIZE];
     const char overflow_msg[] = "WARN: scopeLog msg truncated.\n";
     char *local_buf;
+    char time_buf[23];
+    int msec;
+    struct tm* tm_info;
+    struct timeval tv;
 
     if (!g_log) {
         if (!g_constructor_debug_enabled) return;
@@ -4799,7 +4803,16 @@ scopeLog(cfg_log_level_t level, const char *format, ...)
     cfg_log_level_t cfg_level = logLevel(g_log);
     if ((cfg_level == CFG_LOG_NONE) || (cfg_level > level)) return;
 
-    local_buf = scope_log_var_buf + snprintf(scope_log_var_buf, LOG_BUF_SIZE, "Scope: %s(pid:%d): ", g_proc.procname, g_proc.pid);
+    gettimeofday(&tv, NULL);
+    msec = tv.tv_usec / 1000; 
+    if (msec > 999) {
+        tv.tv_sec++;
+        msec = 0;
+    }
+    tm_info = localtime(&tv.tv_sec);
+    strftime(time_buf, 23, "%Y-%m-%d %H:%M:%S", tm_info);
+
+    local_buf = scope_log_var_buf + snprintf(scope_log_var_buf, LOG_BUF_SIZE, "Scope: %s(pid:%d): [%s.%03d] ", g_proc.procname, g_proc.pid, time_buf, msec);
     size_t local_buf_len = sizeof(scope_log_var_buf) + (scope_log_var_buf - local_buf) - 1;
 
     va_list args;
