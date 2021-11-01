@@ -58,11 +58,13 @@ typedef int (*ssl_rdfunc_t)(SSL *, void *, int);
 typedef int (*ssl_wrfunc_t)(SSL *, const void *, int);
 
 __thread int g_getdelim = 0;
+__thread int g_ssl_fd = -1;
 
 // Forward declaration
 static void *periodic(void *);
 static void doConfig(config_t *);
 static void threadNow(int);
+static void uv__read_hook(void *);
 
 #ifdef __linux__
 extern int arch_prctl(int, unsigned long);
@@ -1042,12 +1044,10 @@ ssl_read_hook(SSL *ssl, void *buf, int num)
     WRAP_CHECK(SSL_read, -1);
     rc = g_fn.SSL_read(ssl, buf, num);
     if (rc > 0) {
-        if (SYMBOL_LOADED(SSL_get_fd)) {
-            int fd = g_fn.SSL_get_fd(ssl);
-            doProtocol((uint64_t)ssl, fd, buf, (size_t)rc, TLSRX, BUF);
-        } else {
-            doProtocol((uint64_t)ssl, -1, buf, (size_t)rc, TLSRX, BUF);
-        }
+        int fd = -1;
+        if (SYMBOL_LOADED(SSL_get_fd)) fd = g_fn.SSL_get_fd(ssl);
+        if ((fd == -1) && (g_ssl_fd != -1)) fd = g_ssl_fd;
+        doProtocol((uint64_t)ssl, fd, buf, (size_t)rc, TLSRX, BUF);
     }
 
     return rc;
@@ -1062,12 +1062,10 @@ ssl_write_hook(SSL *ssl, void *buf, int num)
     WRAP_CHECK(SSL_write, -1);
     rc = g_fn.SSL_write(ssl, buf, num);
     if (rc > 0) {
-        if (SYMBOL_LOADED(SSL_get_fd)) {
-            int fd = g_fn.SSL_get_fd(ssl);
-            doProtocol((uint64_t)ssl, fd, (void *)buf, (size_t)rc, TLSTX, BUF);
-        } else {
-            doProtocol((uint64_t)ssl, -1, (void *)buf, (size_t)rc, TLSTX, BUF);
-        }
+        int fd = -1;
+        if (SYMBOL_LOADED(SSL_get_fd)) fd = g_fn.SSL_get_fd(ssl);
+        if ((fd == -1) && (g_ssl_fd != -1)) fd = g_ssl_fd;
+        doProtocol((uint64_t)ssl, fd, (void *)buf, (size_t)rc, TLSTX, BUF);
     }
 
     return rc;
@@ -1276,8 +1274,13 @@ initHook(int attachedFlag)
 #endif  // __GO__
     }
 
-    if (ebuf && ebuf->buf && (strstr(full_path, "ldscope") == NULL)) {
-        g_ismusl = is_musl(ebuf->buf);
+    if (ebuf && ebuf->buf) {
+
+        // This is in support of a libuv specific extension to map an SSL ID to a fd.
+        // The symbol uv__read is not public. Therefore, we don't resolve it with dlsym.
+        // So, while we have the exec open, we look to see if we can dig it out.
+        g_fn.uv__read = getSymbol(ebuf->buf, "uv__read");
+        scopeLog(CFG_LOG_TRACE, "%s:%d uv__read at %p", __FUNCTION__, __LINE__, g_fn.uv__read);
     }
 
     if (full_path) free(full_path);
@@ -1361,6 +1364,10 @@ initHook(int attachedFlag)
         if ((g_ismusl == TRUE) && g_fn.recvfrom) {
             rc = funchook_prepare(funchook, (void**)&g_fn.recvfrom, internal_recvfrom);
         }
+
+        // Used for mapping SSL IDs to fds with libuv. Must be funchooked since it's internal to libuv
+        if (!g_fn.uv_fileno) g_fn.uv_fileno = load_func(NULL, "uv_fileno");
+        if (g_fn.uv__read) rc = funchook_prepare(funchook, (void**)&g_fn.uv__read, uv__read_hook);
 
         // libmusl
         // Note that both stdout & stderr objects point to the same write function.
@@ -1467,8 +1474,37 @@ initEnv(int *attachedFlag)
 __attribute__((constructor)) void
 init(void)
 {
+
+    // Bootstrapping...  we need to know if we're in musl so we can
+    // call the right initFn function...
+    {
+        char *full_path = NULL;
+        elf_buf_t *ebuf = NULL;
+
+        // Needed for getElf()
+        g_fn.open = dlsym(RTLD_NEXT, "open");
+        if (!g_fn.open) g_fn.open = dlsym(RTLD_DEFAULT, "open");
+        g_fn.close = dlsym(RTLD_NEXT, "close");
+        if (!g_fn.close) g_fn.close = dlsym(RTLD_DEFAULT, "close");
+
+        g_ismusl =
+            ((osGetExePath(&full_path) != -1) &&
+            !strstr(full_path, "ldscope") &&
+            ((ebuf = getElf(full_path))) &&
+            !is_static(ebuf->buf) &&
+            !is_go(ebuf->buf) &&
+            is_musl(ebuf->buf));
+
+        if (full_path) free(full_path);
+        if (ebuf) freeElf(ebuf->buf, ebuf->len);
+    }
+
     // Use dlsym to get addresses for everything in g_fn
-    initFn();
+    if (g_ismusl) {
+        initFn_musl();
+    } else {
+        initFn();
+    }
 
 // TODO: will want to see if this is needed for bash built on ARM...
 #ifndef __aarch64__
@@ -2766,12 +2802,10 @@ SSL_read(SSL *ssl, void *buf, int num)
     rc = g_fn.SSL_read(ssl, buf, num);
 
     if (rc > 0) {
-        if (SYMBOL_LOADED(SSL_get_fd)) {
-            int fd = g_fn.SSL_get_fd(ssl);
-            doProtocol((uint64_t)ssl, fd, buf, (size_t)rc, TLSRX, BUF);
-        } else {
-            doProtocol((uint64_t)ssl, -1, buf, (size_t)rc, TLSRX, BUF);
-        }
+        int fd = -1;
+        if (SYMBOL_LOADED(SSL_get_fd)) fd = g_fn.SSL_get_fd(ssl);
+        if ((fd == -1) && (g_ssl_fd != -1)) fd = g_ssl_fd;
+        doProtocol((uint64_t)ssl, fd, buf, (size_t)rc, TLSRX, BUF);
     }
     return rc;
 }
@@ -2787,12 +2821,10 @@ SSL_write(SSL *ssl, const void *buf, int num)
     rc = g_fn.SSL_write(ssl, buf, num);
 
     if (rc > 0) {
-        if (SYMBOL_LOADED(SSL_get_fd)) {
-            int fd = g_fn.SSL_get_fd(ssl);
-            doProtocol((uint64_t)ssl, fd, (void *)buf, (size_t)rc, TLSTX, BUF);
-        } else {
-            doProtocol((uint64_t)ssl, -1, (void *)buf, (size_t)rc, TLSTX, BUF);
-        }
+        int fd = -1;
+        if (SYMBOL_LOADED(SSL_get_fd)) fd = g_fn.SSL_get_fd(ssl);
+        if ((fd == -1) && (g_ssl_fd != -1)) fd = g_ssl_fd;
+        doProtocol((uint64_t)ssl, fd, (void *)buf, (size_t)rc, TLSTX, BUF);
     }
     return rc;
 }
@@ -4920,6 +4952,19 @@ __fdelt_chk(long int fdelt)
     }
 
     return fdelt / __NFDBITS;
+}
+
+/*
+ * This is a libuv specific function intended to map an SSL ID to a fd.
+ * This libuv function is called in the same call stack as SSL_read.
+ * Therefore, we extract the fd here and use it in a subsequent SSL_read/write.
+ */
+static void
+uv__read_hook(void *stream)
+{
+    if (SYMBOL_LOADED(uv_fileno)) g_fn.uv_fileno(stream, &g_ssl_fd);
+    //scopeLog(CFG_LOG_TRACE, "%s: fd %d", __FUNCTION__, g_ssl_fd);
+    if (g_fn.uv__read) return g_fn.uv__read(stream);
 }
 
 EXPORTWEAK int
